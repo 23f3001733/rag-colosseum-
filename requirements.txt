@@ -3,4 +3,3 @@ uvicorn[standard]
 pydantic
 numpy
 scikit-learn
-sentence-transformers
