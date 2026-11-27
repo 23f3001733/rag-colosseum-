@@ -92,13 +92,8 @@ tfidf_head = TfidfVectorizer(analyzer=toks, sublinear_tf=True)
 M_head = tfidf_head.fit_transform([s[0] for s in SENTS])
 
 DENSE = None
-try:
-    from sentence_transformers import SentenceTransformer
-    # Initialize the model; weights will be downloaded to cache on startup.
-    DENSE = SentenceTransformer(os.getenv("EMB_MODEL", "sentence-transformers/all-MiniLM-L6-v2"))
-    E = DENSE.encode(KB, normalize_embeddings=True)
-except Exception as e:
-    print("Dense model unavailable, using TF-IDF only:", e)
+# We are intentionally leaving DENSE as None to avoid Out of Memory errors on Render's 512MB tier.
+print("Dense embeddings disabled to prevent OOM on 512MB tier. Using TF-IDF only.")
 
 # ------------------------------------------------------------------ prompt-injection scrubbing
 def is_adversarial(q):
