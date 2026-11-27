@@ -65,8 +65,13 @@ ALIASES = {
 }
 ALIAS_RE = re.compile(r"(?<![A-Za-z0-9])(" + "|".join(map(re.escape, ALIASES)) + r")(?![A-Za-z0-9])", re.I)
 
+SYNS = {"keepalive": "heartbeat", "keepalives": "heartbeat", "subordinate": "follower", "subordinates": "followers",
+        "coordinator": "leader", "deadline": "timeout"}
+SYN_RE = re.compile(r"(?<![A-Za-z0-9])(" + "|".join(SYNS) + r")(?![A-Za-z0-9])", re.I)
+
 def expand(q):
     extra = [ALIASES[m.group(1).lower()] for m in ALIAS_RE.finditer(q)]
+    extra += [SYNS[m.group(1).lower()] for m in SYN_RE.finditer(q)]
     if re.search(r"\bhash(es|ing)?\b", q, re.I) and "digest" not in q.lower():
         extra.append("digest")
     return q + " " + " ".join(extra) if extra else q
@@ -113,6 +118,7 @@ class Tfidf:
 
 TF = Tfidf(KB)
 TH = Tfidf([s[0] for s in SENTS])
+STF = Tfidf([s for ss in SENTS for s in ss])   # sentence-level keyword index
 
 # sentence table for sentence-level semantic matching
 SENT_FLAT = [s for i in range(N) for s in SENTS[i]]
@@ -214,7 +220,9 @@ def clean_question(q):
 # ------------------------------------------------------------------ retrieval
 def score_full(text):
     qt = toks(text)
-    lex = 0.8 * TF.sim(text) + 0.2 * TH.sim(text)
+    sl = STF.sim(text)                                         # a single matching sentence is the usual signal
+    slmax = np.array([sl[a:b].max() for a, b in OFFS])
+    lex = 0.5 * (0.8 * TF.sim(text) + 0.2 * TH.sim(text)) + 0.5 * slmax
     pen = np.ones(N)
     for v in [t for t in qt if VERSION.fullmatch(t)]:      # "1.3", "http/3" must match exactly
         for i in range(N):
@@ -330,6 +338,21 @@ UNITS = [
 PREM = re.compile(r"^\s*(?:since|given that|given|assuming(?: that)?|suppose(?: that)?|considering(?: that)?|knowing that|"
                   r"seeing that|because|provided that|if|as)\b[^,]*,\s*(.+)$", re.I | re.S)
 
+PREM_FULL = re.compile(r"^\s*(?:since|given that|given|assuming(?: that)?|suppose(?: that)?|considering(?: that)?|knowing that|"
+                       r"seeing that|because|provided that|if|as)\b([^,]*),\s*(.+)$", re.I | re.S)
+NUM_RE = re.compile(r"\d+(?:\.\d+)?")
+
+def premise_contradicts(base, pid):
+    """True when the question plants a number (\"Since Raft needs 100 nodes...\") that the KB passage does not contain."""
+    m = PREM_FULL.match(base)
+    if not m:
+        return False
+    nums = NUM_RE.findall(m.group(1))
+    if not nums:
+        return False
+    have = set(NUM_RE.findall(KB[pid]))
+    return any(n not in have for n in nums)
+
 def main_clause(q):
     """Drop a planted premise ("Since Raft needs 100 nodes, what is ...") and keep what is really asked."""
     m = PREM.match(q)
@@ -413,6 +436,8 @@ def answer_question(q, k, base=None):
         best = max([float(sc[top])] + [w[1] for w in winners])
     else:
         pids, pool, best = [top], PASS_TOKS[top], float(sc[top])
+    if not multi and premise_contradicts(base, top):
+        return {"answer": None, "sources": [], "scores": [], "confidence": 0.2}
     ds_sel = ds_full
     if ENC is not None and main != base:
         ds_sel = SE @ ENC([expand(main)])[0]
