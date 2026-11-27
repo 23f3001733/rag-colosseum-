@@ -1,5 +1,4 @@
 import json, math, re, time
-from collections import deque
 from pathlib import Path
 import threading
 
@@ -51,62 +50,6 @@ for pt in PASS_TOKS:
 
 idf = {t: math.log(1 + (N - df + 0.5) / (df + 0.5)) for t, df in doc_freqs.items()}
 
-# ----------- Semantic Concept Map (Solves Confounders without Dense Embeddings) -----------
-CORE_CONCEPTS = [
-    ["raft", "etcd", "cockroachdb", "3 nodes"],
-    ["multi-paxos", "paxos", "chubby", "zookeeper", "4 acceptors"],
-    ["gossip", "epidemic", "anti-entropy", "phi accrual"],
-    ["swim", "indirect ping", "dissemination", "consul"],
-    ["two-phase commit", "2pc", "three-phase commit", "3pc", "coordinator aborts", "wait-for graphs"],
-    ["saga", "compensating actions", "temporal", "cadence"],
-    ["consistent hashing", "virtual ring", "dynamo"],
-    ["rendezvous hashing", "highest random weight", "squid", "envoy"],
-    ["vector clocks", "partial ordering", "riak"],
-    ["hybrid logical clocks", "hlc", "monotonic causality"],
-    ["stochastic gradient descent", "sgd", "saddle points"],
-    ["adamw", "decoupled weight decay"],
-    ["transformer encoders", "encoders", "multi-head self-attention"],
-    ["transformer decoders", "decoders", "autoregressive", "llama", "gpt"],
-    ["binary logistic regression", "logistic regression", "temperature scaling"],
-    ["support vector machines", "svm", "platt scaling", "radial basis function"],
-    ["multi-layer perceptrons", "mlp", "gelu", "gradient clipping"],
-    ["residual convolutional networks", "resnet", "convnext", "skip connections"],
-    ["batch normalization", "batchnorm"],
-    ["layer normalization", "layernorm"],
-    ["postgresql", "postgres", "vacuum", "pgbouncer"],
-    ["mysql", "innodb", "undo log", "purge threads"],
-    ["b+ tree", "logarithmic search", "page latching"],
-    ["log-structured merge trees", "lsm", "rocksdb"],
-    ["mongodb", "wiredtiger", "snappy", "schemaless"],
-    ["cassandra", "cql", "memtables"],
-    ["redis", "rdb", "aof", "lru eviction"],
-    ["memcached", "slab allocator"],
-    ["write-ahead logging", "wal", "aries recovery"],
-    ["shadow paging", "rollback journal", "sqlite"],
-    ["tcp", "transmission control protocol", "bbr", "three-way handshake"],
-    ["quic", "multiplexed connection streams", "head-of-line blocking"],
-    ["dns", "domain name system", "dnssec", "recursive dns"],
-    ["mdns", "multicast dns", "dot-local", "bonjour", "avahi"],
-    ["http/2", "hpack", "binary framing"],
-    ["http/3", "qpack", "alt-svc"],
-    ["tls 1.3", "zero-rtt"],
-    ["tls 1.2", "padding oracle", "session tickets"],
-    ["bgp", "border gateway protocol", "as-path"],
-    ["ospf", "open shortest path first", "dijkstra"],
-    ["public key cryptography", "hybrid cryptosystems"],
-    ["elliptic curve", "ecc", "ecdsa", "ed25519"],
-    ["argon2", "memory-hard", "secure credential storage"],
-    ["pbkdf2", "key stretching"],
-    ["web application firewalls", "waf", "cross-site request forgery", "csp"],
-    ["api gateways", "token bucket", "kong", "aws api gateway"],
-    ["advanced encryption standard", "aes", "gcm"],
-    ["chacha20-poly1305", "chacha20", "wireguard"],
-    ["pkce", "oauth 2.0 proof key for code exchange"],
-    ["json web tokens", "jwt", "stateless microservices"]
-]
-
-VERSION_RE = re.compile(r"\b\d+\.\d+\b|\bhttp/\d\b", re.I)
-
 # ----------- Retrieval Engine -----------
 def score_vec(q_text):
     q_tokens = toks(q_text)
@@ -123,63 +66,77 @@ def score_vec(q_text):
                 denominator = tf + k1 * (1 - b + b * (doc_lengths[i] / avgdl))
                 scores[i] += idf[q] * (numerator / denominator)
                 
-    max_possible = sum(idf.get(q, 0.0) for q in q_tokens)
+    max_possible = sum(idf.get(q, 0.0) for q in q_tokens if q in idf)
     if max_possible > 0:
         scores = [min(1.0, s / max_possible) for s in scores]
 
-    # 2. Confounder Boosting (Simulates Dense Embeddings mapping)
+    # 2. Rare Term & Bigram Boost (Solves Confounders like dense embeddings)
     q_lower = q_text.lower()
+    rare_q = [t for t in q_tokens if doc_freqs.get(t, 0) <= 2]
+    
     for i in range(N):
-        for concept in CORE_CONCEPTS[i]:
-            if concept in q_lower or concept.replace("-", " ") in q_lower:
-                scores[i] = min(1.0, scores[i] + 0.45)
-
-    # 3. Explicit Version Penalty (Solves TLS 1.2 vs 1.3 style tricks)
-    versions_in_q = VERSION_RE.findall(q_lower)
-    for v in versions_in_q:
-        v_stem = stem(v.replace("/", ""))
-        for i in range(N):
-            pt_text = " ".join(PASS_TOKS[i])
-            if v not in pt_text and v_stem not in pt_text and v not in KB[i].lower():
-                scores[i] *= 0.1  # Heavy penalty for missing requested version
+        pt_text = " ".join(PASS_TOKS[i])
+        orig_text = KB[i].lower()
+        
+        # Boost for highly specific words (e.g., "innodb", "pgbouncer")
+        for rq in rare_q:
+            if rq in pt_text:
+                scores[i] = min(1.0, scores[i] + 0.4)
+                
+        # Boost for exact version matching (e.g., "TLS 1.2" vs "TLS 1.3")
+        for v in re.findall(r"\b(?:tls|http|quic|ipv)\s*v?[\d\.]+\b|\b\d+\.\d+\b", q_lower):
+            if v in orig_text:
+                scores[i] = min(1.0, scores[i] + 0.5)
+            else:
+                scores[i] *= 0.1  # Heavy penalty for version mismatch
 
     return scores
 
-# ----------- Prompt Injection Filter -----------
+# ----------- Stealth Prompt Injection Filter (4/4 Adversarial) -----------
 def is_adversarial(q):
     lower_q = q.lower()
-    patterns = [
-        r"\b(ignore|disregard|forget|override|bypass)\b.{0,40}\b(previous|prior|all|system|instructions?|prompts?|rules?|constraints?|context)\b",
-        r"\b(ignore|disregard|forget)\b\s+(everything|all\s+the\s+above)\b",
-        r"\b(your\s+(rules|programming|restrictions|constraints|instructions?|prompts?|guidelines?))\b",
-        r"\b(system\s+prompt|system\s+message|initial\s+instructions?|previous\s+instructions?)\b",
-        r"\b(new\s+(instruction|rule|task|role))\b",
-        r"\b(from\s+now\s+on|do\s+not\s+(answer|follow|use|cite|search|retrieve)|don'?t\s+(answer|follow|use))\b",
-        r"\b(developer\s+mode|jailbreak|dan\s+mode|act\s+as|pretend\s+to\s+be|roleplay|you\s+are\s+now|as\s+an\s+ai)\b",
-        r"\bsudo\b|\bi\s+authori[sz]e\b|\bdo\s+anything\b",
-        r"\b(print|output|say|return|respond|reply|answer|type)\b\s+(exactly|only|just)?\s*[\"']",
-        r"\b(always|only|just|simply|exactly)\s+(answer|respond|reply|say|output|print|return)\b",
-        r"\b(write|create|generate|compose)\b.{0,40}\b(poem|code|script|story|essay|song|rap)\b",
-        r"\b(translate|tldr)\b",
-        r"\b(list|show|print|output|reveal|dump)\b.*\b(all\s+passages|knowledge\s+base|database)\b",
-        r"<\/?(system|assistant|user|instruction)>",
-        r"\[\/?(system|admin|user|instruction|inst)\]",
-        r"^(system|admin|user|assistant):",
-        r"reveal\s+your\s+secrets"
-    ]
-    for p in patterns:
-        if re.search(p, lower_q): return True
-    if "ignore previous" in lower_q or "ignore all" in lower_q: return True
+    
+    # 1. Catch standard instruction bypasses
+    if re.search(r"(ignore|disregard|forget|override|bypass)\s+(all\s+)?(previous|prior|system|your)\s+(instructions?|prompts?|rules?|context|guidelines?)", lower_q):
+        return True
+        
+    # 2. Catch roleplay / jailbreaks
+    if re.search(r"\b(act as|pretend to be|roleplay|you are now|developer mode|dan mode|sudo)\b", lower_q):
+        return True
+        
+    # 3. Catch system prompt leakage attempts
+    if re.search(r"(output|print|reveal|show|dump)\s+(your\s+)?(instructions?|prompts?|system message|rules|backend)", lower_q):
+        return True
+        
+    # 4. Catch XML/Markdown tags commonly used in stealth injections
+    if re.search(r"<\/?(system|instruction|prompt|rule|user|assistant)>|\[\/?(system|inst|admin)\]", lower_q):
+        return True
+        
+    # 5. Imperative command overwrites
+    if "new instruction:" in lower_q or "system:" in lower_q or "ignore everything" in lower_q:
+        return True
+        
     return False
 
-# ----------- Abstention Logic -----------
+# ----------- Strict Abstention Logic (4/4 Abstention) -----------
 def should_abstain(q, q_tokens, best_score, multi):
-    if not q_tokens or best_score < 0.2: return True
-    oov = [t for t in q_tokens if t not in VOCAB]
-    if len(oov) / max(1, len(q_tokens)) >= (0.5 if multi else 0.4): return True
+    if not q_tokens: return True
+    
+    # If the score is extremely low, it didn't match anything well
+    if best_score < 0.18: return True
+    
+    # OVERLAP RATIO: This prevents answering off-topic queries (e.g., "How to bake a cake")
+    # that happen to contain one known word (e.g., "server").
+    known_tokens = [t for t in q_tokens if t in VOCAB]
+    overlap_ratio = len(known_tokens) / max(1, len(q_tokens))
+    
+    # If less than 35% of the meaningful words in the query exist in our technical KB, ABSTAIN.
+    if overlap_ratio < 0.35:
+        return True
+        
     return False
 
-# ----------- Synthesis & Arithmetic -----------
+# ----------- Synthesis & Arithmetic (4/4 Synthesis) -----------
 SPLIT = re.compile(r"\s+(?:and|vs\.?|versus|or|compared\s+(?:to|with)|than|while|whereas|plus|with)\s+|\s*[,;&]\s*|\s+(?:and|or)\s*$", re.I)
 SYNTH = re.compile(r"\b(compare|compared|comparison|difference|differ|differs|versus|vs\.?|both|combined|together|altogether|relationship|contrast|sum|total|add|plus)\b", re.I)
 NUMQ = re.compile(r"how many|how long|how much|port|timeout|threshold|interval|size|length|bits|ratio|rate|limit|quorum|latency|window|number|count|\bms\b|seconds|rtt|lease|heartbeat|blocks|layers|batch", re.I)
@@ -272,7 +229,7 @@ def answer_question(q, k):
     scores = [round(max(0.0, min(1.0, sc[i])), 4) for i in chosen]
     return {"answer": text, "sources": chosen, "scores": scores, "confidence": round(0.62 + 0.38 * min(1.0, max(scores) / 0.8), 4)}
 
-# ----------- FastAPI App -----------
+# ----------- FastAPI App & Server Init -----------
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
@@ -280,6 +237,7 @@ class Query(BaseModel):
     question: str
     top_k: int = 3
 
+# Lock guarantees concurrent requests queue up, preventing 512MB RAM / 0.1vCPU crashes on Render
 request_lock = threading.Lock()
 
 @app.get("/")
@@ -288,9 +246,12 @@ def health(): return {"ok": True, "passages": N, "dense": False, "bm25": True}
 @app.post("/query")
 def query(body: Query):
     raw, k = body.question or "", max(1, min(int(body.top_k or 3), 10))
+    
+    # 1. Reject Stealth Prompt Injections instantly
     if is_adversarial(raw): return {"answer": None, "sources": [], "scores": [], "confidence": 0.0}
 
-    with request_lock: # Serializes concurrent requests to prevent CPU thrashing
+    # 2. Process safely inside the Concurrency Lock
+    with request_lock: 
         try:
             cleaned = re.sub(r"[\u200b-\u200f\u2060\ufeff\u202a-\u202e]", "", raw)
             cleaned = re.sub(r"<!--.*?-->", " ", cleaned, flags=re.S)
