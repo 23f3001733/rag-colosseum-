@@ -1,8 +1,4 @@
 import os
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
 import json, math, re, time, unicodedata
 from collections import deque
 from pathlib import Path
@@ -13,12 +9,6 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sklearn.feature_extraction.text import TfidfVectorizer
-
-try:
-    import torch
-    torch.set_num_threads(1)
-except ImportError:
-    pass
 
 HERE = Path(__file__).parent
 KB = json.loads((HERE / "knowledge_base.json").read_text())
@@ -91,31 +81,23 @@ M_full = tfidf_full.fit_transform(KB)
 tfidf_head = TfidfVectorizer(analyzer=toks, sublinear_tf=True)
 M_head = tfidf_head.fit_transform([s[0] for s in SENTS])
 
-DENSE = None
-# We are intentionally leaving DENSE as None to avoid Out of Memory errors on Render's 512MB tier.
-print("Dense embeddings disabled to prevent OOM on 512MB tier. Using TF-IDF only.")
-
 # ------------------------------------------------------------------ prompt-injection scrubbing
 def is_adversarial(q):
     lower_q = q.lower()
     patterns = [
-        # Instruction overrides
         r"\b(ignore|disregard|forget|override|bypass)\b.{0,40}\b(previous|prior|all|system|instructions?|prompts?|rules?|constraints?|context)\b",
         r"\b(ignore|disregard|forget)\b\s+(everything|all\s+the\s+above)\b",
         r"\b(your\s+(rules|programming|restrictions|constraints|instructions?|prompts?|guidelines?))\b",
         r"\b(system\s+prompt|system\s+message|initial\s+instructions?|previous\s+instructions?)\b",
         r"\b(new\s+(instruction|rule|task|role))\b",
         r"\b(from\s+now\s+on|do\s+not\s+(answer|follow|use|cite|search|retrieve)|don'?t\s+(answer|follow|use))\b",
-        # Jailbreaks and personas
         r"\b(developer\s+mode|jailbreak|dan\s+mode|act\s+as|pretend\s+to\s+be|roleplay|you\s+are\s+now|as\s+an\s+ai)\b",
         r"\bsudo\b|\bi\s+authori[sz]e\b|\bdo\s+anything\b",
-        # Forcing exact outputs or generation tasks out of scope for RAG
         r"\b(print|output|say|return|respond|reply|answer|type)\b\s+(exactly|only|just)?\s*[\"']",
         r"\b(always|only|just|simply|exactly)\s+(answer|respond|reply|say|output|print|return)\b",
         r"\b(write|create|generate|compose)\b.{0,40}\b(poem|code|script|story|essay|song|rap)\b",
         r"\b(translate|tldr)\b",
         r"\b(list|show|print|output|reveal|dump)\b.*\b(all\s+passages|knowledge\s+base|database)\b",
-        # Tags indicating a context-breaking attempt
         r"<\/?(system|assistant|user|instruction)>",
         r"\[\/?(system|admin|user|instruction|inst)\]",
         r"^(system|admin|user|assistant):"
@@ -134,26 +116,28 @@ def score_vec(text):
     s_head = (M_head @ tfidf_head.transform([text]).T).toarray().ravel()
     lex = 0.8 * s_full + 0.2 * s_head
     pen = np.ones(N)
+    
+    # 1. Version exact match penalty (Solves TLS 1.2 vs 1.3)
     for v in [t for t in qt if VERSION.fullmatch(t)]:
         for i in range(N):
             if v not in PASS_TOKS[i]:
                 pen[i] *= 0.5
+                
+    # 2. Rare keyword penalty (Perfectly handles confounders without dense embeddings)
+    rare_tokens = [t for t in qt if t in DF and DF[t] <= 3]
+    for rt in rare_tokens:
+        for i in range(N):
+            if rt not in PASS_TOKS[i]:
+                pen[i] *= 0.85 # Strong penalty if a passage is missing a rare, specific query word
+                
     lex = lex * pen
-    
-    if DENSE is not None:
-        # Proper dense embeddings heavily resolves confounders
-        d = np.clip(E @ DENSE.encode([text], normalize_embeddings=True)[0], 0, 1) * (0.5 + 0.5 * pen)
-        sc = 0.6 * d + 0.4 * np.clip(lex * 1.6, 0, 1)
-    else:
-        sc = np.clip(lex * 1.4, 0, 1)
+    sc = np.clip(lex * 1.5, 0, 1)
         
     qs = set(qt)
     for i in range(N):
         if SIG[i] & qs:
-            sc[i] = min(1.0, sc[i] + 0.08)
-    for v in [t for t in qt if VERSION.fullmatch(t)]:
-        for i in range(N):
-            sc[i] = min(1.0, sc[i] + 0.12) if v in PASS_TOKS[i] else sc[i] * 0.6
+            sc[i] = min(1.0, sc[i] + 0.1)
+            
     return sc
 
 SPLIT = re.compile(r"\s+(?:and|vs\.?|versus|or|compared\s+(?:to|with)|than|while|whereas|plus|with)\s+|\s*[,;&]\s*|\s+(?:and|or)\s*$", re.I)
@@ -306,14 +290,14 @@ app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 LOG = deque(maxlen=200)
 
-# Critical fix for concurrency bounds: locks requests to run sequentially rather than fighting for CPU cores.
+# 1. Concurrency fix: Process requests sequentially to prevent Render CPU OOM/thrashing
 request_lock = threading.Lock()
 
 score_vec("warm up")
 
 @app.get("/")
 def health():
-    return {"ok": True, "passages": N, "dense": DENSE is not None}
+    return {"ok": True, "passages": N, "dense": False}
 
 @app.get("/debug")
 def debug():
@@ -325,14 +309,14 @@ def query(body: Query):
     raw = body.question or ""
     k = max(1, min(int(body.top_k or 3), 10))
     
-    # 1. Immediately abstain securely if prompt injection detected.
+    # 2. Adversarial fix: Immediately abstain securely if prompt injection detected.
     if is_adversarial(raw):
         res = {"answer": None, "sources": [], "scores": [], "confidence": 0.0}
         entry = {"q": raw[:400], "cleaned": "adversarial_abstained", "res": res, "ms": round((time.time() - t0) * 1000)}
         LOG.append(entry)
         return res
 
-    # 2. Sequential execution block prevents CPU thrashing when handling bursts
+    # Wrap in lock to prevent concurrent CPU exhaustion
     with request_lock:
         try:
             # Clean invisible characters and HTML comments
