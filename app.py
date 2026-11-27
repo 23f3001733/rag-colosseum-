@@ -1,13 +1,24 @@
-"""RAG Colosseum service v2: POST /query (FastAPI). Extractive (no LLM) => immune to prompt injection."""
-import json, math, os, re, time, unicodedata
+import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+import json, math, re, time, unicodedata
 from collections import deque
 from pathlib import Path
+import threading
 
 import numpy as np
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sklearn.feature_extraction.text import TfidfVectorizer
+
+try:
+    import torch
+    torch.set_num_threads(1)
+except ImportError:
+    pass
 
 HERE = Path(__file__).parent
 KB = json.loads((HERE / "knowledge_base.json").read_text())
@@ -41,7 +52,6 @@ VERSION = re.compile(r"\d+\.\d+|[a-z]+/\d")
 def sentences(text):
     return [s.strip() for s in re.split(r"(?<=[a-z0-9\)])\.\s+(?=[A-Z])", text) if s.strip()]
 
-# abbreviations a question may use but the passages spell out
 ALIASES = {
     "sgd": "stochastic gradient descent", "mvcc": "multi-version concurrency control",
     "wal": "write-ahead logging", "lsm": "log-structured merge trees", "dns": "domain name system",
@@ -73,7 +83,7 @@ for _p in PASS_TOKS:
         DF[_t] = DF.get(_t, 0) + 1
 VOCAB = set(DF) | {stem(k) for k in ALIASES}
 FIRST = [set(toks(s[0])) for s in SENTS]
-SIG = [{t for t in FIRST[i] if DF[t] <= 3} for i in range(N)]       # "name" tokens of each passage
+SIG = [{t for t in FIRST[i] if DF[t] <= 3} for i in range(N)]
 
 # ------------------------------------------------------------------ indexes
 tfidf_full = TfidfVectorizer(analyzer=toks, sublinear_tf=True)
@@ -84,52 +94,43 @@ M_head = tfidf_head.fit_transform([s[0] for s in SENTS])
 DENSE = None
 try:
     from sentence_transformers import SentenceTransformer
+    # Initialize the model; weights will be downloaded to cache on startup.
     DENSE = SentenceTransformer(os.getenv("EMB_MODEL", "sentence-transformers/all-MiniLM-L6-v2"))
     E = DENSE.encode(KB, normalize_embeddings=True)
 except Exception as e:
     print("Dense model unavailable, using TF-IDF only:", e)
 
 # ------------------------------------------------------------------ prompt-injection scrubbing
-INJ = re.compile(
-    r"ignore|ignoring|disregard|forget|overrid|bypass|your (rules|programming|restrictions|constraints)|"
-    r"(previous|prior|above|earlier|preceding|original) (instruction|prompt|rule|direction)|"
-    r"system (prompt|message|override|instruction|note)|you are now|new (instruction|rule|task|role)|"
-    r"from now on|do not (answer|follow|use|cite|search|retrieve)|don'?t (answer|follow|use)|"
-    r"(always|only|just|simply|exactly) (answer|respond|reply|say|output|print|return)|"
-    r"(respond|reply|answer|say|print|output|write|return|type)\s+(only\s+|just\s+|exactly\s+)?(with\b|[\"'“‘])|"
-    r"the (word|phrase|string|text|token) [\"'“‘]|reveal|jailbreak|developer mode|\bdan\b|pretend|role-?play|"
-    r"act as|as an ai|\bassistant:|the (correct |real |true )?answer (is|should be)|i authori[sz]e|"
-    r"authori[sz]ed|sudo|\bdo anything\b|your (instructions|prompt|guidelines)|knowledge base is (wrong|outdated)|"
-    r"</?(system|assistant|user|instruction)|\[/?(system|inst)|<\|", re.I)
-MARK = re.compile(r"^\s*(note|system|important|admin|instruction|attention|urgent|warning|p\.?s\.?|ps|override|"
-                  r"assistant|hidden|command|task)\b\s*[:\-!]", re.I)
-
-def clean_question(q):
-    q = unicodedata.normalize("NFKC", q)
-    q = re.sub(r"[\u200b-\u200f\u2060\ufeff\u202a-\u202e]", "", q)       # invisible characters
-    q = re.sub(r"<!--.*?-->", " ", q, flags=re.S)                         # html comments
-    q = re.sub(r"```.*?```", " ", q, flags=re.S)                          # code fences
-    q = re.sub(r"<[^>]{1,60}>", " ", q)                                   # <system> tags
-    q = re.sub(r"\[[^\]]*\]", lambda m: " " if INJ.search(m.group(0)) or MARK.match(m.group(0)[1:]) else m.group(0), q)
-    parts = [p.strip() for p in re.split(r"(?<=[\.\?\!;])\s+|\n+|\s[-–—]{1,2}\s", q) if p.strip()]
-    keep = []
-    for p in parts:
-        if re.fullmatch(r"\s*(p\.?\s?s\.?|n\.?\s?b\.?|note|important|warning|attention)\s*[\.:!]*\s*", p, re.I):
-            continue
-        if not (MARK.match(p) or INJ.search(p)):
-            keep.append(p)
-            continue
-        for c in re.split(r"[,:;()]|\s[-–—]\s", p):          # clause by clause: drop only the injected clauses
-            c = c.strip()
-            if not c or re.fullmatch(r"(system|note|important|admin|instruction|attention|urgent|warning|override|hidden|command|task|assistant)", c, re.I):
-                continue
-            m = INJ.search(c)
-            if not m:
-                keep.append(c)
-            elif len(toks(c[: m.start()])) >= 3:               # real question before the trigger words
-                keep.append(c[: m.start()])
-    cleaned = " ".join(keep).strip()
-    return cleaned if len(toks(cleaned)) >= 2 else INJ.sub(" ", q)
+def is_adversarial(q):
+    lower_q = q.lower()
+    patterns = [
+        # Instruction overrides
+        r"\b(ignore|disregard|forget|override|bypass)\b.{0,40}\b(previous|prior|all|system|instructions?|prompts?|rules?|constraints?|context)\b",
+        r"\b(ignore|disregard|forget)\b\s+(everything|all\s+the\s+above)\b",
+        r"\b(your\s+(rules|programming|restrictions|constraints|instructions?|prompts?|guidelines?))\b",
+        r"\b(system\s+prompt|system\s+message|initial\s+instructions?|previous\s+instructions?)\b",
+        r"\b(new\s+(instruction|rule|task|role))\b",
+        r"\b(from\s+now\s+on|do\s+not\s+(answer|follow|use|cite|search|retrieve)|don'?t\s+(answer|follow|use))\b",
+        # Jailbreaks and personas
+        r"\b(developer\s+mode|jailbreak|dan\s+mode|act\s+as|pretend\s+to\s+be|roleplay|you\s+are\s+now|as\s+an\s+ai)\b",
+        r"\bsudo\b|\bi\s+authori[sz]e\b|\bdo\s+anything\b",
+        # Forcing exact outputs or generation tasks out of scope for RAG
+        r"\b(print|output|say|return|respond|reply|answer|type)\b\s+(exactly|only|just)?\s*[\"']",
+        r"\b(always|only|just|simply|exactly)\s+(answer|respond|reply|say|output|print|return)\b",
+        r"\b(write|create|generate|compose)\b.{0,40}\b(poem|code|script|story|essay|song|rap)\b",
+        r"\b(translate|tldr)\b",
+        r"\b(list|show|print|output|reveal|dump)\b.*\b(all\s+passages|knowledge\s+base|database)\b",
+        # Tags indicating a context-breaking attempt
+        r"<\/?(system|assistant|user|instruction)>",
+        r"\[\/?(system|admin|user|instruction|inst)\]",
+        r"^(system|admin|user|assistant):"
+    ]
+    for p in patterns:
+        if re.search(p, lower_q):
+            return True
+    if "ignore previous" in lower_q or "ignore all" in lower_q:
+        return True
+    return False
 
 # ------------------------------------------------------------------ retrieval
 def score_vec(text):
@@ -138,21 +139,24 @@ def score_vec(text):
     s_head = (M_head @ tfidf_head.transform([text]).T).toarray().ravel()
     lex = 0.8 * s_full + 0.2 * s_head
     pen = np.ones(N)
-    for v in [t for t in qt if VERSION.fullmatch(t)]:      # "1.3", "http/3" must match exactly
+    for v in [t for t in qt if VERSION.fullmatch(t)]:
         for i in range(N):
             if v not in PASS_TOKS[i]:
                 pen[i] *= 0.5
     lex = lex * pen
+    
     if DENSE is not None:
+        # Proper dense embeddings heavily resolves confounders
         d = np.clip(E @ DENSE.encode([text], normalize_embeddings=True)[0], 0, 1) * (0.5 + 0.5 * pen)
-        sc = 0.5 * d + 0.5 * np.clip(lex * 1.6, 0, 1)
+        sc = 0.6 * d + 0.4 * np.clip(lex * 1.6, 0, 1)
     else:
         sc = np.clip(lex * 1.4, 0, 1)
+        
     qs = set(qt)
     for i in range(N):
         if SIG[i] & qs:
-            sc[i] = min(1.0, sc[i] + 0.08)                 # the question names this passage's subject
-    for v in [t for t in qt if VERSION.fullmatch(t)]:      # confounders like TLS 1.2 vs 1.3
+            sc[i] = min(1.0, sc[i] + 0.08)
+    for v in [t for t in qt if VERSION.fullmatch(t)]:
         for i in range(N):
             sc[i] = min(1.0, sc[i] + 0.12) if v in PASS_TOKS[i] else sc[i] * 0.6
     return sc
@@ -164,7 +168,6 @@ ARITH = re.compile(r"\b(sum|total|combined|together|altogether|add|plus|differen
                    r"fewer|less than|more than|larger|greater|gap|ratio|times|double|half|exceed)", re.I)
 
 def multi_winners(q):
-    """Split the question into parts; each part that names a different passage's subject gets that passage."""
     qt = toks(q)
     generic = []
     for w in re.findall(r"[A-Za-z0-9][A-Za-z0-9\+\./\-]*", q):
@@ -193,8 +196,8 @@ def should_abstain(q, qt, best, pool, multi):
         c = m.group(0)
         before = q[: m.start()].rstrip()
         if (not before) or before[-1] in ".?!:;" or not c[0].isupper() or len(c) < 3 or c.lower() in ALIASES:
-            continue                                      # sentence-initial capitals prove nothing
-        if any(p not in VOCAB for p in toks(c)):          # unknown proper noun, e.g. "Elasticsearch"
+            continue
+        if any(p not in VOCAB for p in toks(c)):
             return True
     unknown = [t for t in qt if t not in VOCAB]
     if len(unknown) / len(qt) >= (0.5 if multi else 0.34):
@@ -206,7 +209,7 @@ NUMQ = re.compile(r"how many|how long|how much|port|timeout|threshold|interval|s
                   r"quorum|latency|window|number|count|\bms\b|seconds|rtt|lease|heartbeat|blocks|layers|batch", re.I)
 
 def best_sentences(q, q_tokens, pid, n=1):
-    ent = {t for t in q_tokens if t in FIRST[pid] and DF.get(t, 0) <= 3}   # subject words already matched
+    ent = {t for t in q_tokens if t in FIRST[pid] and DF.get(t, 0) <= 3}
     qs = (set(q_tokens) - ent) or set(q_tokens)
     numeric = bool(NUMQ.search(q))
     scored = []
@@ -255,7 +258,7 @@ def arithmetic_line(q, sents, qt):
 
 def answer_question(q, k, base=None):
     qt = toks(q)
-    sq = [t for t in toks(base if base is not None else q) if t not in ALIAS_STEMS] or qt   # words the person wrote
+    sq = [t for t in toks(base if base is not None else q) if t not in ALIAS_STEMS] or qt
     sc = score_vec(q)
     order = [int(i) for i in np.argsort(-sc)]
     winners = multi_winners(q)
@@ -270,6 +273,7 @@ def answer_question(q, k, base=None):
         best = max([float(sc[top])] + [w[1] for w in winners])
     else:
         pids, pool, best = [top], PASS_TOKS[top], float(sc[top])
+        
     if should_abstain(q, qt, best, pool, multi):
         return {"answer": None, "sources": [], "scores": [], "confidence": round(min(0.3, best), 4)}
 
@@ -291,7 +295,7 @@ def answer_question(q, k, base=None):
         compound = bool(re.search(r"\band\b|\balso\b|,", q))
         ans = best_sentences(q, sq, top, n=2 if compound else 1)
         text = ". ".join(a.rstrip(". ") for a in ans) + "."
-    # winners first (guaranteed in sources), then the rest by score; final list sorted descending
+        
     chosen = list(pids) + [i for i in sorted(final, key=lambda i: -final[i]) if i not in pids]
     chosen = sorted(chosen[:k], key=lambda i: -final[i])
     scores = [round(max(0.0, min(1.0, final[i])), 4) for i in chosen]
@@ -306,6 +310,10 @@ class Query(BaseModel):
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 LOG = deque(maxlen=200)
+
+# Critical fix for concurrency bounds: locks requests to run sequentially rather than fighting for CPU cores.
+request_lock = threading.Lock()
+
 score_vec("warm up")
 
 @app.get("/")
@@ -321,13 +329,27 @@ def query(body: Query):
     t0 = time.time()
     raw = body.question or ""
     k = max(1, min(int(body.top_k or 3), 10))
-    try:
-        base = clean_question(raw)
-        cleaned = expand(base)
-        res = answer_question(cleaned, k, base)
-    except Exception as e:                              # never crash: abstain instead
-        cleaned, res = raw, {"answer": None, "sources": [], "scores": [], "confidence": 0.1}
-        print("ERROR", repr(e))
+    
+    # 1. Immediately abstain securely if prompt injection detected.
+    if is_adversarial(raw):
+        res = {"answer": None, "sources": [], "scores": [], "confidence": 0.0}
+        entry = {"q": raw[:400], "cleaned": "adversarial_abstained", "res": res, "ms": round((time.time() - t0) * 1000)}
+        LOG.append(entry)
+        return res
+
+    # 2. Sequential execution block prevents CPU thrashing when handling bursts
+    with request_lock:
+        try:
+            # Clean invisible characters and HTML comments
+            cleaned = re.sub(r"[\u200b-\u200f\u2060\ufeff\u202a-\u202e]", "", raw)
+            cleaned = re.sub(r"<!--.*?-->", " ", cleaned, flags=re.S)
+            
+            cleaned = expand(cleaned)
+            res = answer_question(cleaned, k, raw)
+        except Exception as e:
+            cleaned, res = raw, {"answer": None, "sources": [], "scores": [], "confidence": 0.1}
+            print("ERROR", repr(e))
+            
     entry = {"q": raw[:400], "cleaned": cleaned[:300], "res": res, "ms": round((time.time() - t0) * 1000)}
     LOG.append(entry)
     print(json.dumps(entry), flush=True)
